@@ -3,12 +3,13 @@ name: Pyinstaller builds
 on:
   workflow_dispatch:
   push:
-    tags:
-      - 'v*'
+    branches: [ "main" ]
+    #tags:
+    #  - 'v*'
 
 jobs:
   build-windows:
-    runs-on: windows-2019
+    runs-on: windows-2022
     steps:
       - name: Checkout
         uses: actions/checkout@v3
