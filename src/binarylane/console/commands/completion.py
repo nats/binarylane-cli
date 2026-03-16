@@ -1,11 +1,15 @@
 from __future__ import annotations
 
+import logging
 import sys
+from argparse import SUPPRESS
 from typing import Dict, List, Tuple
 
 from binarylane.console.commands import descriptors
 from binarylane.console.metadata import program_name
-from binarylane.console.runners import Runner
+from binarylane.console.runners import Context, Runner
+
+logger = logging.getLogger(__name__)
 
 
 def _build_tree() -> Dict[str, List[Tuple[str, str]]]:
@@ -26,6 +30,47 @@ def _build_tree() -> Dict[str, List[Tuple[str, str]]]:
     return {k: sorted(v.items()) for k, v in sorted(raw.items())}
 
 
+def _extract_command_options() -> Dict[str, List[Tuple[str, str]]]:
+    """Extract options for each leaf command by loading and configuring it."""
+    options_map: Dict[str, List[Tuple[str, str]]] = {}
+
+    for descriptor in descriptors:
+        try:
+            context = Context()
+            context.name = descriptor.name
+            context.description = descriptor.description
+            cmd = descriptor.runner_type(context)
+            cmd._parser.configure()
+
+            opts: List[Tuple[str, str]] = []
+            seen: set = set()
+            for action in cmd._parser._actions:
+                opt_strs = [s for s in action.option_strings if s.startswith("--")]
+                if not opt_strs or action.help == SUPPRESS:
+                    continue
+                opt = opt_strs[0]
+                if opt in seen:
+                    continue
+                seen.add(opt)
+                help_text = action.help or ""
+                if "%" in help_text:
+                    try:
+                        help_text = help_text % {
+                            "choices": ", ".join(str(c) for c in (action.choices or [])),
+                            "default": str(action.default) if action.default is not None else "",
+                        }
+                    except (KeyError, TypeError):
+                        pass
+                opts.append((opt, help_text))
+
+            key = descriptor.name.replace(" ", "_")
+            options_map[key] = sorted(opts)
+        except Exception:
+            logger.debug("Failed to extract options for %s", descriptor.name, exc_info=True)
+
+    return options_map
+
+
 def _bash_escape(s: str) -> str:
     """Escape for use inside bash double quotes."""
     return s.replace("\\", "\\\\").replace('"', '\\"').replace("$", "\\$").replace("`", "\\`")
@@ -33,16 +78,24 @@ def _bash_escape(s: str) -> str:
 
 def _generate_bash(prog: str) -> str:
     tree = _build_tree()
+    options_map = _extract_command_options()
 
-    case_entries: List[str] = []
+    # Subcommand case entries
+    sub_entries: List[str] = []
     for prefix, children in tree.items():
         pattern = prefix.replace(" ", "_") if prefix else ""
-        items = "\n".join(
-            f'            "{name}:{_bash_escape(desc)}"' for name, desc in children
-        )
-        case_entries.append(f'        "{pattern}") completions=(\n{items}\n            ) ;;')
+        items = "\n".join(f'            "{name}:{_bash_escape(desc)}"' for name, desc in children)
+        sub_entries.append(f'        "{pattern}") completions=(\n{items}\n            ) ;;')
+    sub_cases = "\n".join(sub_entries)
 
-    cases = "\n".join(case_entries)
+    # Option case entries
+    opt_entries: List[str] = []
+    for cmd_key, opts in sorted(options_map.items()):
+        if not opts:
+            continue
+        items = "\n".join(f'            "{opt}:{_bash_escape(desc)}"' for opt, desc in opts)
+        opt_entries.append(f'        "{cmd_key}") completions=(\n{items}\n            ) ;;')
+    opt_cases = "\n".join(opt_entries)
 
     return f"""\
 # bash completion for {prog}
@@ -50,6 +103,39 @@ def _generate_bash(prog: str) -> str:
 #
 # Usage: eval "$({prog} completion bash)"
 # Or:    {prog} completion bash > /etc/bash_completion.d/{prog}
+
+__bl_format() {{
+    # Filter completions array by cur prefix and format with descriptions
+    local -a items=("$@")
+    local -a matches=()
+    local entry comp
+    for entry in "${{items[@]}}"; do
+        comp="${{entry%%:*}}"
+        if [[ "$comp" == "$cur"* ]]; then
+            matches+=("$entry")
+        fi
+    done
+
+    if [[ ${{#matches[@]}} -eq 0 ]]; then
+        return
+    elif [[ ${{#matches[@]}} -eq 1 ]]; then
+        COMPREPLY=("${{matches[0]%%:*}}")
+    else
+        local maxlen=0
+        for entry in "${{matches[@]}}"; do
+            comp="${{entry%%:*}}"
+            (( ${{#comp}} > maxlen )) && maxlen=${{#comp}}
+        done
+        local desc min_width=$(( (${{COLUMNS:-80}} + 1) / 2 + 1 ))
+        for entry in "${{matches[@]}}"; do
+            comp="${{entry%%:*}}"
+            desc="${{entry#*:}}"
+            printf -v line "%-*s  # %s" "$maxlen" "$comp" "$desc"
+            printf -v line "%-*s" "$min_width" "$line"
+            COMPREPLY+=("$line")
+        done
+    fi
+}}
 
 _{prog}_completions() {{
     local cur prev words cword
@@ -78,49 +164,36 @@ _{prog}_completions() {{
         ((i++))
     done
 
-    # Complete options
+    # Complete options when current word starts with -
     if [[ "$cur" == -* ]]; then
-        COMPREPLY=($(compgen -W "--help --context --api-token" -- "$cur"))
+        local -a completions=()
+        local try_path="$cmd_path"
+        while true; do
+            case "$try_path" in
+{opt_cases}
+            esac
+            if [[ ${{#completions[@]}} -gt 0 ]]; then break; fi
+            local shorter="${{try_path%_*}}"
+            if [[ "$shorter" == "$try_path" ]]; then break; fi
+            try_path="$shorter"
+        done
+        if [[ ${{#completions[@]}} -eq 0 ]]; then
+            completions=(
+                "--help:Display command options and descriptions"
+                "--context:Name of authentication context"
+                "--api-token:API token to use with BinaryLane API"
+            )
+        fi
+        __bl_format "${{completions[@]}}"
         return
     fi
 
-    # Get completions with descriptions
+    # Complete subcommands
     local -a completions=()
     case "$cmd_path" in
-{cases}
+{sub_cases}
     esac
-
-    # Filter by current word prefix
-    local -a matches=()
-    local entry comp
-    for entry in "${{completions[@]}}"; do
-        comp="${{entry%%:*}}"
-        if [[ "$comp" == "$cur"* ]]; then
-            matches+=("$entry")
-        fi
-    done
-
-    if [[ ${{#matches[@]}} -eq 0 ]]; then
-        return
-    elif [[ ${{#matches[@]}} -eq 1 ]]; then
-        # Single match - insert just the command word
-        COMPREPLY=("${{matches[0]%%:*}}")
-    else
-        # Multiple matches - show with aligned descriptions
-        local maxlen=0
-        for entry in "${{matches[@]}}"; do
-            comp="${{entry%%:*}}"
-            (( ${{#comp}} > maxlen )) && maxlen=${{#comp}}
-        done
-        local desc min_width=$(( (${{COLUMNS:-80}} + 1) / 2 + 1 ))
-        for entry in "${{matches[@]}}"; do
-            comp="${{entry%%:*}}"
-            desc="${{entry#*:}}"
-            printf -v line "%-*s  # %s" "$maxlen" "$comp" "$desc"
-            printf -v line "%-*s" "$min_width" "$line"
-            COMPREPLY+=("$line")
-        done
-    fi
+    __bl_format "${{completions[@]}}"
 }}
 
 complete -o default -F _{prog}_completions {prog}
@@ -134,16 +207,24 @@ def _zsh_escape(s: str) -> str:
 
 def _generate_zsh(prog: str) -> str:
     tree = _build_tree()
+    options_map = _extract_command_options()
 
-    case_entries: List[str] = []
+    # Subcommand case entries
+    sub_entries: List[str] = []
     for prefix, children in tree.items():
         pattern = prefix.replace(" ", "_") if prefix else ""
-        items = "\n".join(
-            f"            '{name}:{_zsh_escape(desc)}'" for name, desc in children
-        )
-        case_entries.append(f'        "{pattern}") commands=(\n{items}\n            ) ;;')
+        items = "\n".join(f"            '{name}:{_zsh_escape(desc)}'" for name, desc in children)
+        sub_entries.append(f'        "{pattern}") commands=(\n{items}\n            ) ;;')
+    sub_cases = "\n".join(sub_entries)
 
-    cases = "\n".join(case_entries)
+    # Option case entries
+    opt_entries: List[str] = []
+    for cmd_key, opts in sorted(options_map.items()):
+        if not opts:
+            continue
+        items = "\n".join(f"            '{opt}[{_zsh_escape(desc)}]'" for opt, desc in opts)
+        opt_entries.append(f'        "{cmd_key}") options=(\n{items}\n            ) ;;')
+    opt_cases = "\n".join(opt_entries)
 
     return f"""\
 #compdef {prog}
@@ -164,18 +245,31 @@ _{prog}() {{
     done
 
     if [[ "${{words[$CURRENT]}}" == -* ]]; then
-        local -a options=(
-            '--help:Display command options and descriptions'
-            '--context:Name of authentication context'
-            '--api-token:API token to use with BinaryLane API'
-        )
+        local -a options=()
+        local try_path="$cmd_path"
+        while true; do
+            case "$try_path" in
+{opt_cases}
+            esac
+            if [[ ${{#options[@]}} -gt 0 ]]; then break; fi
+            local shorter="${{try_path%_*}}"
+            if [[ "$shorter" == "$try_path" ]]; then break; fi
+            try_path="$shorter"
+        done
+        if [[ ${{#options[@]}} -eq 0 ]]; then
+            options=(
+                '--help[Display command options and descriptions]'
+                '--context[Name of authentication context]'
+                '--api-token[API token to use with BinaryLane API]'
+            )
+        fi
         _describe 'option' options
         return
     fi
 
     local -a commands=()
     case "$cmd_path" in
-{cases}
+{sub_cases}
     esac
 
     _describe 'command' commands
