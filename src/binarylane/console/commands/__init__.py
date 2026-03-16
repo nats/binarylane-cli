@@ -7,6 +7,7 @@ from binarylane.console.runners import Descriptor
 
 __all__ = ["descriptors"]
 descriptors: List[Descriptor] = list(api.descriptors) + [
+    Descriptor(".commands.completion", "completion", "Generate shell completion script"),
     Descriptor(".commands.configure", "configure", "Configure access to BinaryLane API"),
     Descriptor(".commands.version", "version", "Show the current version"),
 ]
